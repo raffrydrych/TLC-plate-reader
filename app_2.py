@@ -10,6 +10,7 @@ from streamlit_image_coordinates import streamlit_image_coordinates
 from PIL import Image, ImageDraw
 from skimage import exposure
 from skimage.feature import blob_log
+from skimage.morphology import white_tophat, disk
 
 st.set_page_config(page_title="Płytka TLC - obliczanie Rf", layout="wide")
 st.title("🧪 Płytka TLC - zaznaczanie linii i obliczanie Rf")
@@ -112,7 +113,7 @@ LIGHT_MODES = {
 }
 
 
-def prepare_detection_crop(image, x0, y0, x1, y1, light_mode="white"):
+def prepare_detection_crop(image, x0, y0, x1, y1, light_mode="white", max_sigma=20):
     """Zwraca znormalizowany kontrastowo wycinek (0-1), w którym szukane
     plamki są jasnymi 'blobami' - niezależnie od trybu oświetlenia:
 
@@ -122,32 +123,39 @@ def prepare_detection_crop(image, x0, y0, x1, y1, light_mode="white"):
       na zielono; plamki gaszą tę fluorescencję i wychodzą ciemne na zielonym
       tle -> kanał zielony daje najlepszy kontrast, też odwracamy.
     - uv366: związki fluoryzują i są jasne na ciemnym tle -> używamy
-      maksymalnej jasności spośród kanałów RGB i NIE odwracamy (plamki są
-      już jasne, to tło jest ciemne).
+      maksymalnej jasności spośród kanałów RGB i NIE odwracamy.
 
-    Rozciąganie kontrastu (2-98 percentyl) sprawia, że działa niezależnie od
-    tego, jak jasne/ciemne jest oryginalne zdjęcie."""
+    Dodatkowo stosujemy lokalne wypłaszczenie tła (filtr top-hat): zamiast
+    porównywać jasność piksela do sztywnego progu, porównujemy ją do
+    najbliższego otoczenia. Dzięki temu działa nawet wtedy, gdy całe tło
+    samo w sobie mocno świeci (np. jednolicie turkusowa płytka pod 366 nm) -
+    liczy się lokalna 'wypukłość', a nie bezwzględna jasność."""
     crop = image.crop((x0, y0, x1, y1))
     arr = np.array(crop).astype(float) / 255.0  # H, W, 3
 
     if light_mode == "uv254":
         intensity = arr[..., 1]  # kanał zielony - najlepszy kontrast wygaszenia
-        detection_map = 1.0 - intensity
+        base_map = 1.0 - intensity
     elif light_mode == "uv366":
-        intensity = arr.max(axis=-1)  # jasność niezależna od koloru fluorescencji
-        detection_map = intensity
+        base_map = arr.max(axis=-1)  # jasność niezależna od koloru fluorescencji
     else:  # white
         intensity = np.array(crop.convert("L")).astype(float) / 255.0
-        detection_map = 1.0 - intensity
+        base_map = 1.0 - intensity
 
-    p2, p98 = np.percentile(detection_map, (2, 98))
+    selem_radius = max(3, int(max_sigma * 2))
+    try:
+        flattened = white_tophat(base_map, disk(selem_radius))
+    except Exception:
+        flattened = base_map
+
+    p2, p98 = np.percentile(flattened, (2, 98))
     if p98 > p2:
-        detection_map = exposure.rescale_intensity(detection_map, in_range=(p2, p98), out_range=(0, 1))
-    return detection_map
+        flattened = exposure.rescale_intensity(flattened, in_range=(p2, p98), out_range=(0, 1))
+    return flattened
 
 
 def detect_spots(image, x0, y0, x1, y1, threshold, min_sigma, max_sigma, light_mode="white"):
-    detection_map = prepare_detection_crop(image, x0, y0, x1, y1, light_mode)
+    detection_map = prepare_detection_crop(image, x0, y0, x1, y1, light_mode, max_sigma)
     blobs = blob_log(
         detection_map, min_sigma=min_sigma, max_sigma=max_sigma, num_sigma=8, threshold=threshold
     )
@@ -155,6 +163,16 @@ def detect_spots(image, x0, y0, x1, y1, threshold, min_sigma, max_sigma, light_m
 
 
 uploaded_file = st.file_uploader("Wgraj zdjęcie płytki TLC", type=["png", "jpg", "jpeg"])
+
+# szybki podgląd wymiarów zdjęcia (bez zużywania strumienia pliku), żeby dobrać
+# rozsądne domyślne rozmiary plamki proporcjonalnie do rozdzielczości zdjęcia -
+# małe zdjęcia (np. zrzuty ekranu) potrzebują dużo mniejszych wartości niż
+# zdjęcia z aparatu w wysokiej rozdzielczości
+img_w = img_h = None
+if uploaded_file is not None:
+    _probe = Image.open(uploaded_file)
+    img_w, img_h = _probe.size
+    uploaded_file.seek(0)
 
 mode = st.radio(
     "Co zaznaczasz kolejnym kliknięciem na zdjęciu?",
@@ -184,10 +202,16 @@ with btn_col3:
         st.rerun()
 
 with st.expander("⚙️ Ustawienia automatycznego wykrywania plamek", expanded=True):
+    # wartości referencyjne dobrane dla zdjęcia o krótszym boku ~400 px,
+    # skalowane proporcjonalnie do rzeczywistej rozdzielczości wgranego zdjęcia
+    REF_DIM = 400
+    min_dim = min(img_w, img_h) if img_w else REF_DIM
+    scale = max(0.15, min(min_dim / REF_DIM, 3.0))
+
     LIGHT_DEFAULTS = {
         "white": {"threshold": 0.05, "min_sigma": 3, "max_sigma": 20},
-        "uv254": {"threshold": 0.04, "min_sigma": 3, "max_sigma": 20},
-        "uv366": {"threshold": 0.08, "min_sigma": 3, "max_sigma": 25},
+        "uv254": {"threshold": 0.06, "min_sigma": 3, "max_sigma": 20},
+        "uv366": {"threshold": 0.15, "min_sigma": 3, "max_sigma": 25},
     }
     light_mode = st.selectbox(
         "Typ oświetlenia / wizualizacji plamek",
@@ -195,14 +219,30 @@ with st.expander("⚙️ Ustawienia automatycznego wykrywania plamek", expanded=
         format_func=lambda k: LIGHT_MODES[k],
     )
     _d = LIGHT_DEFAULTS[light_mode]
+    scaled_min_sigma = max(2, round(_d["min_sigma"] * scale))
+    scaled_max_sigma = max(scaled_min_sigma + 2, round(_d["max_sigma"] * scale))
+    if min_dim != REF_DIM:
+        st.caption(
+            f"Zdjęcie ma {img_w}×{img_h}px - domyślne rozmiary plamki dostosowane "
+            f"proporcjonalnie (skala {scale:.2f}×)."
+        )
+
     # klucz zawiera tryb oświetlenia - każdy tryb pamięta swoje własne,
     # osobno dostrojone ustawienia po przełączeniu
     det_threshold = st.slider(
         "Czułość wykrywania (niższa = wykryje więcej)",
         0.01, 0.5, _d["threshold"], 0.01, key=f"thr_{light_mode}",
     )
-    det_min_sigma = st.slider("Min. rozmiar plamki (px)", 1, 20, _d["min_sigma"], key=f"min_{light_mode}")
-    det_max_sigma = st.slider("Maks. rozmiar plamki (px)", 5, 60, _d["max_sigma"], key=f"max_{light_mode}")
+    det_min_sigma = st.slider(
+        "Min. rozmiar plamki (px)", 1, max(20, scaled_max_sigma), scaled_min_sigma, key=f"min_{light_mode}"
+    )
+    det_max_sigma = st.slider(
+        "Maks. rozmiar plamki (px)", 5, max(60, scaled_max_sigma * 2), scaled_max_sigma, key=f"max_{light_mode}"
+    )
+    det_min_dist = st.slider(
+        "Min. odległość między osobnymi plamkami (px) - większa wartość scala sąsiednie wykrycia w jedną plamkę",
+        5, 100, max(15, round(scaled_max_sigma * 1.5)), key=f"dist_{light_mode}",
+    )
     show_debug_preview = st.checkbox("Pokaż podgląd analizowanego obszaru (do debugowania)", value=False)
 
 col1, col2 = st.columns([3, 1])
@@ -215,7 +255,9 @@ if uploaded_file is not None:
         detect_help = (
             "Szuka tylko w zaznaczonym obszarze (tryb 4)."
             if st.session_state.region
-            else "Brak zaznaczonego obszaru - przeszuka cały pas między baseline a front (albo całe zdjęcie)."
+            else "Brak zaznaczonego obszaru - przeszuka cały pas między baseline a front (albo całe zdjęcie). "
+                 "Wskazówka: jeśli zdjęcie ma linijkę/ramkę z podziałką na brzegu, zaznacz obszar (tryb 4) "
+                 "obejmujący tylko samą płytkę - inaczej znaczniki skali mogą zostać wykryte jako fałszywe plamki."
         )
         if st.button("🔎 Wykryj plamki automatycznie", help=detect_help):
             if st.session_state.region:
@@ -233,7 +275,7 @@ if uploaded_file is not None:
             )
             added = 0
             for x, y in found:
-                if is_far_enough(x, y, st.session_state.spots):
+                if is_far_enough(x, y, st.session_state.spots, min_dist=det_min_dist):
                     add_spot(x, y)
                     added += 1
             skipped = len(found) - added
@@ -261,7 +303,7 @@ if uploaded_file is not None:
                 dy0, dy1 = sorted([st.session_state.baseline_y, st.session_state.front_y])
             else:
                 dy0, dy1 = 0, h
-        preview = prepare_detection_crop(base_image, dx0, dy0, dx1, dy1, light_mode)
+        preview = prepare_detection_crop(base_image, dx0, dy0, dx1, dy1, light_mode, det_max_sigma)
         st.caption("Podgląd: obszar analizowany przez detektor (jasne plamy = potencjalne plamki)")
         st.image(preview, clamp=True, use_container_width=True)
 
