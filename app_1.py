@@ -6,7 +6,7 @@ from streamlit_image_coordinates import streamlit_image_coordinates
 from PIL import Image, ImageDraw
 
 st.set_page_config(page_title="Płytka TLC - obliczanie Rf", layout="wide")
-st.title("🧪 Płytka TLC - zaznaczanie linii i obliczanie Rf")
+st.title("TLC_tracker")
 
 # ---------------------------------------------------------------------------
 # Czerwony krzyżyk jako kursor nad obrazkiem.
