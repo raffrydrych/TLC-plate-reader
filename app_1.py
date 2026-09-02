@@ -1,4 +1,6 @@
 import base64
+import csv
+import io
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -6,16 +8,8 @@ from streamlit_image_coordinates import streamlit_image_coordinates
 from PIL import Image, ImageDraw
 
 st.set_page_config(page_title="Płytka TLC - obliczanie Rf", layout="wide")
-st.title("TLC_tracker")
+st.title("TLC tracker")
 
-# ---------------------------------------------------------------------------
-# Czerwony krzyżyk jako kursor nad obrazkiem.
-# streamlit-image-coordinates renderuje obrazek wewnątrz osobnego komponentu
-# (iframe), dlatego zwykłe st.markdown z CSS go nie dosięgnie. Ten skrypt
-# co ok. 400 ms szuka iframe'ów na stronie i wstrzykuje do nich styl kursora.
-# To rozwiązanie "best-effort" - w większości przeglądarek działa, bo
-# komponenty Streamlit są serwowane z tego samego originu.
-# ---------------------------------------------------------------------------
 CURSOR_SVG = (
     '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22">'
     '<line x1="11" y1="0" x2="11" y2="22" stroke="red" stroke-width="2"/>'
@@ -60,6 +54,8 @@ if "front_y" not in st.session_state:
     st.session_state.front_y = None
 if "spots" not in st.session_state:
     st.session_state.spots = []  # lista (x, y, rf)
+if "last_processed_click" not in st.session_state:
+    st.session_state.last_processed_click = None  # ostatnie (x, y), które już obsłużyliśmy
 
 uploaded_file = st.file_uploader("Wgraj zdjęcie płytki TLC", type=["png", "jpg", "jpeg"])
 
@@ -73,6 +69,7 @@ if st.button("🔄 Resetuj wszystko"):
     st.session_state.baseline_y = None
     st.session_state.front_y = None
     st.session_state.spots = []
+    st.session_state.last_processed_click = None
     st.rerun()
 
 col1, col2 = st.columns([3, 1])
@@ -80,7 +77,7 @@ col1, col2 = st.columns([3, 1])
 if uploaded_file is not None:
     base_image = Image.open(uploaded_file).convert("RGB")
 
-    # rysujemy kopię obrazu z liniami baseline/front oraz kropkami plamek
+    # kopia obrazu z narysowanymi liniami baseline/front oraz kropkami plamek
     display_image = base_image.copy()
     draw = ImageDraw.Draw(display_image)
     w, h = display_image.size
@@ -104,33 +101,35 @@ if uploaded_file is not None:
         st.caption("Kliknij na zdjęciu zgodnie z wybranym trybem powyżej.")
         coords = streamlit_image_coordinates(display_image, key="tlc_image")
 
+    # Przetwarzamy TYLKO faktycznie nowe kliknięcie (inne niż ostatnio obsłużone).
+    # Dzięki temu zmiana trybu bez nowego kliknięcia niczego nie dodaje.
     if coords is not None:
-        x, y = coords["x"], coords["y"]
+        click = (coords["x"], coords["y"])
+        if click != st.session_state.last_processed_click:
+            st.session_state.last_processed_click = click
+            x, y = click
 
-        if mode.startswith("1"):
-            if st.session_state.baseline_y != y:
+            if mode.startswith("1"):
                 st.session_state.baseline_y = y
                 st.rerun()
 
-        elif mode.startswith("2"):
-            if st.session_state.front_y != y:
+            elif mode.startswith("2"):
                 st.session_state.front_y = y
                 st.rerun()
 
-        else:  # Plamka
-            if st.session_state.baseline_y is None or st.session_state.front_y is None:
-                st.warning("Najpierw zaznacz baseline i front (tryby 1 i 2).")
-            else:
-                baseline_y = st.session_state.baseline_y
-                front_y = st.session_state.front_y
-                denom = baseline_y - front_y
-                already = [(sx, sy) for sx, sy, _ in st.session_state.spots]
-                if denom == 0:
-                    st.error("Baseline i front mają tę samą wysokość - popraw zaznaczenie.")
-                elif (x, y) not in already:
-                    rf = (baseline_y - y) / denom
-                    st.session_state.spots.append((x, y, rf))
-                    st.rerun()
+            else:  # Plamka
+                if st.session_state.baseline_y is None or st.session_state.front_y is None:
+                    st.warning("Najpierw zaznacz baseline i front (tryby 1 i 2).")
+                else:
+                    baseline_y = st.session_state.baseline_y
+                    front_y = st.session_state.front_y
+                    denom = baseline_y - front_y
+                    if denom == 0:
+                        st.error("Baseline i front mają tę samą wysokość - popraw zaznaczenie.")
+                    else:
+                        rf = (baseline_y - y) / denom
+                        st.session_state.spots.append((x, y, rf))
+                        st.rerun()
 
     with col2:
         st.subheader("Wyniki")
@@ -143,9 +142,27 @@ if uploaded_file is not None:
             f"{st.session_state.front_y if st.session_state.front_y is not None else '—'}"
         )
         st.divider()
+
         if st.session_state.spots:
             for i, (x, y, rf) in enumerate(st.session_state.spots, start=1):
                 st.metric(f"Plamka {i} — Rf", f"{rf:.3f}", help=f"X={x}, Y={y}")
+
+            st.divider()
+            csv_buffer = io.StringIO()
+            writer = csv.writer(csv_buffer)
+            writer.writerow(["Baseline (y, px)", st.session_state.baseline_y])
+            writer.writerow(["Front (y, px)", st.session_state.front_y])
+            writer.writerow([])
+            writer.writerow(["Plamka", "X (px)", "Y (px)", "Rf"])
+            for i, (x, y, rf) in enumerate(st.session_state.spots, start=1):
+                writer.writerow([i, x, y, f"{rf:.4f}"])
+
+            st.download_button(
+                "⬇️ Eksportuj wyniki do CSV",
+                data=csv_buffer.getvalue(),
+                file_name="wyniki_rf.csv",
+                mime="text/csv",
+            )
         else:
             st.info("Brak zaznaczonych plamek.")
 else:
