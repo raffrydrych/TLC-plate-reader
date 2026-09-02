@@ -105,23 +105,51 @@ def is_far_enough(x, y, spots, min_dist=20):
     return True
 
 
-def prepare_detection_crop(image, x0, y0, x1, y1):
-    """Zwraca znormalizowany kontrastowo, odwrócony wycinek (0-1), w którym
-    ciemne plamki stają się jasnymi 'blobami'. Rozciąganie kontrastu (2-98
-    percentyl) sprawia, że działa niezależnie od tego, jak jasne/ciemne
-    jest oryginalne zdjęcie (np. słabo kontrastowe zdjęcia spod UV)."""
-    gray = np.array(image.convert("L").crop((x0, y0, x1, y1))) / 255.0
-    inverted = 1.0 - gray
-    p2, p98 = np.percentile(inverted, (2, 98))
+LIGHT_MODES = {
+    "white": "Światło białe (widzialne) - plamki ciemne/kolorowe na jasnym tle",
+    "uv254": "UV 254 nm - wygaszenie fluorescencji, plamki ciemne na zielonym tle",
+    "uv366": "UV 366 nm - plamki fluoryzują jasno na ciemnym tle",
+}
+
+
+def prepare_detection_crop(image, x0, y0, x1, y1, light_mode="white"):
+    """Zwraca znormalizowany kontrastowo wycinek (0-1), w którym szukane
+    plamki są jasnymi 'blobami' - niezależnie od trybu oświetlenia:
+
+    - white: plamki są ciemniejsze niż jasne tło płytki -> używamy jasności
+      (skala szarości) i odwracamy (1 - jasność).
+    - uv254: podłoże zawiera wskaźnik fluorescencyjny i pod UV 254 nm świeci
+      na zielono; plamki gaszą tę fluorescencję i wychodzą ciemne na zielonym
+      tle -> kanał zielony daje najlepszy kontrast, też odwracamy.
+    - uv366: związki fluoryzują i są jasne na ciemnym tle -> używamy
+      maksymalnej jasności spośród kanałów RGB i NIE odwracamy (plamki są
+      już jasne, to tło jest ciemne).
+
+    Rozciąganie kontrastu (2-98 percentyl) sprawia, że działa niezależnie od
+    tego, jak jasne/ciemne jest oryginalne zdjęcie."""
+    crop = image.crop((x0, y0, x1, y1))
+    arr = np.array(crop).astype(float) / 255.0  # H, W, 3
+
+    if light_mode == "uv254":
+        intensity = arr[..., 1]  # kanał zielony - najlepszy kontrast wygaszenia
+        detection_map = 1.0 - intensity
+    elif light_mode == "uv366":
+        intensity = arr.max(axis=-1)  # jasność niezależna od koloru fluorescencji
+        detection_map = intensity
+    else:  # white
+        intensity = np.array(crop.convert("L")).astype(float) / 255.0
+        detection_map = 1.0 - intensity
+
+    p2, p98 = np.percentile(detection_map, (2, 98))
     if p98 > p2:
-        inverted = exposure.rescale_intensity(inverted, in_range=(p2, p98), out_range=(0, 1))
-    return inverted
+        detection_map = exposure.rescale_intensity(detection_map, in_range=(p2, p98), out_range=(0, 1))
+    return detection_map
 
 
-def detect_spots(image, x0, y0, x1, y1, threshold, min_sigma, max_sigma):
-    inverted = prepare_detection_crop(image, x0, y0, x1, y1)
+def detect_spots(image, x0, y0, x1, y1, threshold, min_sigma, max_sigma, light_mode="white"):
+    detection_map = prepare_detection_crop(image, x0, y0, x1, y1, light_mode)
     blobs = blob_log(
-        inverted, min_sigma=min_sigma, max_sigma=max_sigma, num_sigma=8, threshold=threshold
+        detection_map, min_sigma=min_sigma, max_sigma=max_sigma, num_sigma=8, threshold=threshold
     )
     return [(int(bx) + x0, int(by) + y0) for by, bx, _sigma in blobs]
 
@@ -155,10 +183,26 @@ with btn_col3:
         st.session_state.region_start = None
         st.rerun()
 
-with st.expander("⚙️ Ustawienia automatycznego wykrywania plamek"):
-    det_threshold = st.slider("Czułość wykrywania (niższa = wykryje więcej)", 0.01, 0.5, 0.05, 0.01)
-    det_min_sigma = st.slider("Min. rozmiar plamki (px)", 1, 20, 3)
-    det_max_sigma = st.slider("Maks. rozmiar plamki (px)", 5, 60, 20)
+with st.expander("⚙️ Ustawienia automatycznego wykrywania plamek", expanded=True):
+    LIGHT_DEFAULTS = {
+        "white": {"threshold": 0.05, "min_sigma": 3, "max_sigma": 20},
+        "uv254": {"threshold": 0.04, "min_sigma": 3, "max_sigma": 20},
+        "uv366": {"threshold": 0.08, "min_sigma": 3, "max_sigma": 25},
+    }
+    light_mode = st.selectbox(
+        "Typ oświetlenia / wizualizacji plamek",
+        options=list(LIGHT_MODES.keys()),
+        format_func=lambda k: LIGHT_MODES[k],
+    )
+    _d = LIGHT_DEFAULTS[light_mode]
+    # klucz zawiera tryb oświetlenia - każdy tryb pamięta swoje własne,
+    # osobno dostrojone ustawienia po przełączeniu
+    det_threshold = st.slider(
+        "Czułość wykrywania (niższa = wykryje więcej)",
+        0.01, 0.5, _d["threshold"], 0.01, key=f"thr_{light_mode}",
+    )
+    det_min_sigma = st.slider("Min. rozmiar plamki (px)", 1, 20, _d["min_sigma"], key=f"min_{light_mode}")
+    det_max_sigma = st.slider("Maks. rozmiar plamki (px)", 5, 60, _d["max_sigma"], key=f"max_{light_mode}")
     show_debug_preview = st.checkbox("Pokaż podgląd analizowanego obszaru (do debugowania)", value=False)
 
 col1, col2 = st.columns([3, 1])
@@ -184,7 +228,9 @@ if uploaded_file is not None:
                 else:
                     y0, y1 = 0, h
 
-            found = detect_spots(base_image, x0, y0, x1, y1, det_threshold, det_min_sigma, det_max_sigma)
+            found = detect_spots(
+                base_image, x0, y0, x1, y1, det_threshold, det_min_sigma, det_max_sigma, light_mode
+            )
             added = 0
             for x, y in found:
                 if is_far_enough(x, y, st.session_state.spots):
@@ -215,7 +261,7 @@ if uploaded_file is not None:
                 dy0, dy1 = sorted([st.session_state.baseline_y, st.session_state.front_y])
             else:
                 dy0, dy1 = 0, h
-        preview = prepare_detection_crop(base_image, dx0, dy0, dx1, dy1)
+        preview = prepare_detection_crop(base_image, dx0, dy0, dx1, dy1, light_mode)
         st.caption("Podgląd: obszar analizowany przez detektor (jasne plamy = potencjalne plamki)")
         st.image(preview, clamp=True, use_container_width=True)
 
