@@ -8,6 +8,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from streamlit_image_coordinates import streamlit_image_coordinates
 from PIL import Image, ImageDraw
+from skimage import exposure
 from skimage.feature import blob_log
 
 st.set_page_config(page_title="Płytka TLC - obliczanie Rf", layout="wide")
@@ -104,9 +105,21 @@ def is_far_enough(x, y, spots, min_dist=20):
     return True
 
 
-def detect_spots(image, x0, y0, x1, y1, threshold, min_sigma, max_sigma):
+def prepare_detection_crop(image, x0, y0, x1, y1):
+    """Zwraca znormalizowany kontrastowo, odwrócony wycinek (0-1), w którym
+    ciemne plamki stają się jasnymi 'blobami'. Rozciąganie kontrastu (2-98
+    percentyl) sprawia, że działa niezależnie od tego, jak jasne/ciemne
+    jest oryginalne zdjęcie (np. słabo kontrastowe zdjęcia spod UV)."""
     gray = np.array(image.convert("L").crop((x0, y0, x1, y1))) / 255.0
-    inverted = 1.0 - gray  # plamki zwykle są ciemniejsze niż tło płytki
+    inverted = 1.0 - gray
+    p2, p98 = np.percentile(inverted, (2, 98))
+    if p98 > p2:
+        inverted = exposure.rescale_intensity(inverted, in_range=(p2, p98), out_range=(0, 1))
+    return inverted
+
+
+def detect_spots(image, x0, y0, x1, y1, threshold, min_sigma, max_sigma):
+    inverted = prepare_detection_crop(image, x0, y0, x1, y1)
     blobs = blob_log(
         inverted, min_sigma=min_sigma, max_sigma=max_sigma, num_sigma=8, threshold=threshold
     )
@@ -143,9 +156,10 @@ with btn_col3:
         st.rerun()
 
 with st.expander("⚙️ Ustawienia automatycznego wykrywania plamek"):
-    det_threshold = st.slider("Czułość wykrywania (niższa = wykryje więcej)", 0.02, 0.5, 0.12, 0.01)
+    det_threshold = st.slider("Czułość wykrywania (niższa = wykryje więcej)", 0.01, 0.5, 0.05, 0.01)
     det_min_sigma = st.slider("Min. rozmiar plamki (px)", 1, 20, 3)
     det_max_sigma = st.slider("Maks. rozmiar plamki (px)", 5, 60, 20)
+    show_debug_preview = st.checkbox("Pokaż podgląd analizowanego obszaru (do debugowania)", value=False)
 
 col1, col2 = st.columns([3, 1])
 
@@ -176,8 +190,34 @@ if uploaded_file is not None:
                 if is_far_enough(x, y, st.session_state.spots):
                     add_spot(x, y)
                     added += 1
-            st.toast(f"Wykryto i dodano {added} nowych plamek.")
+            skipped = len(found) - added
+            st.session_state["_last_detect_msg"] = (
+                f"Znaleziono {len(found)} potencjalnych plamek, dodano {added} nowych"
+                + (f" (pominięto {skipped} jako zbyt blisko istniejących)." if skipped else ".")
+            )
+            if len(found) == 0:
+                st.session_state["_last_detect_msg"] += (
+                    " Nic nie znaleziono - spróbuj obniżyć czułość w ustawieniach (mniejsza wartość)"
+                    " albo poszerzyć zakres rozmiaru plamki."
+                )
             st.rerun()
+
+    if st.session_state.get("_last_detect_msg"):
+        st.info(st.session_state["_last_detect_msg"])
+
+    if show_debug_preview:
+        if st.session_state.region:
+            dx0, dy0 = st.session_state.region["x0"], st.session_state.region["y0"]
+            dx1, dy1 = st.session_state.region["x1"], st.session_state.region["y1"]
+        else:
+            dx0, dx1 = 0, w
+            if st.session_state.baseline_y is not None and st.session_state.front_y is not None:
+                dy0, dy1 = sorted([st.session_state.baseline_y, st.session_state.front_y])
+            else:
+                dy0, dy1 = 0, h
+        preview = prepare_detection_crop(base_image, dx0, dy0, dx1, dy1)
+        st.caption("Podgląd: obszar analizowany przez detektor (jasne plamy = potencjalne plamki)")
+        st.image(preview, clamp=True, use_container_width=True)
 
     # kopia obrazu z narysowanymi liniami baseline/front, obszarem i plamkami
     display_image = base_image.copy()
