@@ -1,0 +1,5 @@
+streamlit
+streamlit-image-coordinates
+pillow
+numpy
+scikit-image
