@@ -63,6 +63,10 @@ if "spots" not in st.session_state:
     st.session_state.spots = []  # lista dict: id, x, y, rf, name
 if "last_processed_click" not in st.session_state:
     st.session_state.last_processed_click = None
+if "region" not in st.session_state:
+    st.session_state.region = None  # dict: x0, y0, x1, y1
+if "region_start" not in st.session_state:
+    st.session_state.region_start = None  # (x, y) pierwszego rogu, w trakcie zaznaczania
 
 
 def calc_rf(y):
@@ -100,13 +104,13 @@ def is_far_enough(x, y, spots, min_dist=20):
     return True
 
 
-def detect_spots(image, y0, y1, threshold, min_sigma, max_sigma):
-    gray = np.array(image.convert("L").crop((0, y0, image.width, y1))) / 255.0
+def detect_spots(image, x0, y0, x1, y1, threshold, min_sigma, max_sigma):
+    gray = np.array(image.convert("L").crop((x0, y0, x1, y1))) / 255.0
     inverted = 1.0 - gray  # plamki zwykle są ciemniejsze niż tło płytki
     blobs = blob_log(
         inverted, min_sigma=min_sigma, max_sigma=max_sigma, num_sigma=8, threshold=threshold
     )
-    return [(int(bx), int(by) + y0) for by, bx, _sigma in blobs]
+    return [(int(bx) + x0, int(by) + y0) for by, bx, _sigma in blobs]
 
 
 uploaded_file = st.file_uploader("Wgraj zdjęcie płytki TLC", type=["png", "jpg", "jpeg"])
@@ -117,17 +121,25 @@ mode = st.radio(
         "1) Baseline (linia startu)",
         "2) Front (czoło rozpuszczalnika)",
         "3) Plamka (dodaj ręcznie klikając)",
+        "4) Obszar wykrywania (2 kliknięcia = 2 rogi)",
     ],
     horizontal=True,
 )
 
-btn_col1, btn_col2 = st.columns([1, 1])
+btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 1])
 with btn_col1:
     if st.button("🔄 Resetuj wszystko"):
         st.session_state.baseline_y = None
         st.session_state.front_y = None
         st.session_state.spots = []
         st.session_state.last_processed_click = None
+        st.session_state.region = None
+        st.session_state.region_start = None
+        st.rerun()
+with btn_col3:
+    if st.button("✖️ Wyczyść obszar wykrywania"):
+        st.session_state.region = None
+        st.session_state.region_start = None
         st.rerun()
 
 with st.expander("⚙️ Ustawienia automatycznego wykrywania plamek"):
@@ -142,12 +154,23 @@ if uploaded_file is not None:
     w, h = base_image.size
 
     with btn_col2:
-        if st.button("🔎 Wykryj plamki automatycznie"):
-            if st.session_state.baseline_y is not None and st.session_state.front_y is not None:
-                y0, y1 = sorted([st.session_state.baseline_y, st.session_state.front_y])
+        detect_help = (
+            "Szuka tylko w zaznaczonym obszarze (tryb 4)."
+            if st.session_state.region
+            else "Brak zaznaczonego obszaru - przeszuka cały pas między baseline a front (albo całe zdjęcie)."
+        )
+        if st.button("🔎 Wykryj plamki automatycznie", help=detect_help):
+            if st.session_state.region:
+                x0, y0 = st.session_state.region["x0"], st.session_state.region["y0"]
+                x1, y1 = st.session_state.region["x1"], st.session_state.region["y1"]
             else:
-                y0, y1 = 0, h
-            found = detect_spots(base_image, y0, y1, det_threshold, det_min_sigma, det_max_sigma)
+                x0, x1 = 0, w
+                if st.session_state.baseline_y is not None and st.session_state.front_y is not None:
+                    y0, y1 = sorted([st.session_state.baseline_y, st.session_state.front_y])
+                else:
+                    y0, y1 = 0, h
+
+            found = detect_spots(base_image, x0, y0, x1, y1, det_threshold, det_min_sigma, det_max_sigma)
             added = 0
             for x, y in found:
                 if is_far_enough(x, y, st.session_state.spots):
@@ -156,7 +179,7 @@ if uploaded_file is not None:
             st.toast(f"Wykryto i dodano {added} nowych plamek.")
             st.rerun()
 
-    # kopia obrazu z narysowanymi liniami baseline/front oraz plamkami
+    # kopia obrazu z narysowanymi liniami baseline/front, obszarem i plamkami
     display_image = base_image.copy()
     draw = ImageDraw.Draw(display_image)
 
@@ -169,6 +192,15 @@ if uploaded_file is not None:
         y = st.session_state.front_y
         draw.line([(0, y), (w, y)], fill="green", width=3)
         draw.text((5, min(h - 15, y + 5)), "front", fill="green")
+
+    if st.session_state.region:
+        r = st.session_state.region
+        draw.rectangle([r["x0"], r["y0"], r["x1"], r["y1"]], outline="orange", width=3)
+    elif st.session_state.region_start:
+        sx, sy = st.session_state.region_start
+        rr = 5
+        draw.ellipse([sx - rr, sy - rr, sx + rr, sy + rr], outline="orange", width=2)
+        draw.text((sx + 8, sy - 8), "1. róg zaznaczony - kliknij 2. róg", fill="orange")
 
     for s in st.session_state.spots:
         r = 5
@@ -198,12 +230,26 @@ if uploaded_file is not None:
                 recalc_all_rf()
                 st.rerun()
 
-            else:  # Plamka - dodanie ręczne
+            elif mode.startswith("3"):  # Plamka - dodanie ręczne
                 if st.session_state.baseline_y is None or st.session_state.front_y is None:
                     st.warning("Najpierw zaznacz baseline i front (tryby 1 i 2).")
                 else:
                     add_spot(x, y)
                     st.rerun()
+
+            else:  # Obszar wykrywania - dwa kliknięcia (dwa rogi)
+                if st.session_state.region_start is None:
+                    st.session_state.region_start = (x, y)
+                else:
+                    sx, sy = st.session_state.region_start
+                    st.session_state.region = {
+                        "x0": min(sx, x),
+                        "y0": min(sy, y),
+                        "x1": max(sx, x),
+                        "y1": max(sy, y),
+                    }
+                    st.session_state.region_start = None
+                st.rerun()
 
     with col2:
         st.subheader("Wyniki")
@@ -215,6 +261,9 @@ if uploaded_file is not None:
             f"Front (y): "
             f"{st.session_state.front_y if st.session_state.front_y is not None else '—'}"
         )
+        if st.session_state.region:
+            r = st.session_state.region
+            st.write(f"Obszar wykrywania: ({r['x0']},{r['y0']}) → ({r['x1']},{r['y1']})")
         st.divider()
 
         if st.session_state.spots:
